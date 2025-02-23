@@ -1,0 +1,4 @@
+Skapat ett request som tar emot en bild från en kamera som sedan analyzeras och ger tillbaka svaret grinden öppnas automatiskt om regnummer är Godkänd, 
+lägger till regnumret i databasen som "Ej Godkänd" om systemet inte hittar en match och skickar en notis till app eller skickar en notis till app om regnumret existerar
+men har status Ej Godkänd.
+Har även skapat ett request som lägger till en ny plåt i databasen.

@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+opencv-python
+pytesseract
+numpy
+mysql-connector-python
+python-dotenv
+loguru
