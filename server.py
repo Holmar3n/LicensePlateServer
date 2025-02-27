@@ -189,52 +189,117 @@ async def webcam_picture():
 
 
 # 📸 Analys av registreringsskylt
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import io
+import re
+from PIL import Image, ImageEnhance, ImageFilter
+from paddleocr import PaddleOCR
+from sqlalchemy.sql import text as sql_text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine
+
+app = FastAPI()
+
+# 🔍 OCR-inställning
+ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+
+# 📂 Databasinställningar
+DB_USER = "root"
+DB_PASSWORD = "HG103961h"
+DB_HOST = "localhost"
+DB_PORT = 3306
+DB_NAME = "license_plate_db"
+
+# 📂 Skapa databasanslutning
+engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+Session = sessionmaker(bind=engine)
+
+
+def process_image(image_bytes: bytes) -> str:
+    """Bearbetar bilden för bättre OCR igenkänning."""
+    image = Image.open(io.BytesIO(image_bytes)).convert("L")
+
+    # Förbättra kontrast och skärpa
+    image = image.filter(ImageFilter.GaussianBlur(radius=1))
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(2.0)
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(2.0)
+
+    # Ändra storlek och optimera
+    image = image.resize((800, 600), Image.Resampling.LANCZOS)
+
+    processed_image_path = "processed_image.jpg"
+    image.save(processed_image_path, format="JPEG", quality=85, optimize=True)
+
+    return processed_image_path
+
+
 @app.post("/AnalyzePicture")
 async def analyze_picture(file: UploadFile = File(...)):
-    image = Image.open(io.BytesIO(await file.read())).convert("L").resize((800, 600), Image.Resampling.LANCZOS)
-    processed_image_path = "processed_image.jpg"
-    image.save(processed_image_path)
+    try:
+        # 🖼️ Läs in bilden
+        image_data = await file.read()
+        if not image_data or len(image_data) == 0:
+            return JSONResponse(content={"error": "Ingen bild mottagen."}, status_code=400)
 
-    ocr_result = ocr.ocr(processed_image_path, cls=False)
+        processed_image_path = process_image(image_data)
 
-    plate_number = None
-    for line in ocr_result:
-        for word in line:
-            if isinstance(word[1], tuple) and len(word[1]) == 2:
-                text_value = word[1][0]
-                confidence = word[1][1]
-
-                if re.match(r'^[A-Z]{3}\s?\d{2,3}[A-Z]?$', text_value) and confidence > 0.5:
-                    plate_number = text_value.replace(" ", "")
-                    break
-        if plate_number:
-            break
-
-    if plate_number:
-        session = Session()
+        # 🔍 Kör OCR
         try:
+            ocr_result = ocr.ocr(processed_image_path, cls=False)
+            if ocr_result is None or ocr_result == [None]:  
+                return JSONResponse(content={"status": "invalid", "message": "Kunde inte identifiera ett registreringsnummer."}, status_code=200)
+        except Exception as e:
+            return JSONResponse(content={"error": f"OCR-fel: {str(e)}"}, status_code=500)
+
+        print("OCR-resultat:", ocr_result)
+
+        # 🚗 Extrahera registreringsnummer
+        plate_number = None
+        if ocr_result:
+            for line in ocr_result:
+                if line is None:
+                    continue
+                for word in line:
+                    if isinstance(word[1], tuple) and len(word[1]) == 2:
+                        text_value, confidence = word[1]
+                        if re.match(r'^[A-Z]{3}\s?\d{2,3}[A-Z]?$', text_value) and confidence > 0.5:
+                            plate_number = text_value.replace(" ", "")
+                            break
+                if plate_number:
+                    break
+
+        # 🚨 Om ingen skylt hittas, returnera tydligt meddelande
+        if not plate_number:
+            return JSONResponse(content={"status": "invalid", "message": "Kunde inte identifiera ett registreringsnummer."}, status_code=200)
+
+        # 🔍 Kontrollera registreringsnumret i databasen
+        try:
+            session = Session()
             check_query = sql_text("SELECT status FROM plates WHERE plate_number = :plate")
             result = session.execute(check_query, {"plate": plate_number}).fetchone()
-
-            if result:
-                status = result[0]
-                if status == "Godkänd":
-                    async with httpx.AsyncClient() as client:
-                        response = await client.post("http://127.0.0.1:8080/ControlGate", json={"action": "open"})
-                        if response.status_code == 200:
-                            return {"plate_number": plate_number, "status": status, "action": "Grinden har öppnats."}
-                        else:
-                            return {"plate_number": plate_number, "status": status, "action": "Kunde inte öppna grinden."}
-                else:
-                    return {"plate_number": plate_number, "status": status, "action": "Statusen tillåter inte grindöppning."}
-            else:
-                return {"message": "Registreringsnumret existerar inte i databasen."}
-        except Exception as e:
-            return {"error": str(e)}
-        finally:
             session.close()
-    else:
-        return {"message": "Ingen registreringsskylt kunde identifieras."}
+        except Exception as e:
+            return JSONResponse(content={"error": f"Databasfel: {str(e)}"}, status_code=500)
+
+        # 🏷️ Hantering av databassvar
+        if result:
+            if result[0] == "Godkänd":
+                return JSONResponse(content={"status": "valid", "plate_number": plate_number}, status_code=200)
+            else:
+                return JSONResponse(content={"status": "invalid", "message": "Registreringsnumret är ej tillåtet.", "plate_number": plate_number}, status_code=200)
+        else:
+            return JSONResponse(content={"status": "invalid", "message": "Kunde inte hitta registreringsnumret i databasen."}, status_code=200)
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+
+
 
 # 🛠️ Lägg till en ny registreringsskylt
 @app.post("/AddPlate")
